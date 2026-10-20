@@ -1,0 +1,134 @@
+# Written by the reel bot on the laptop (run.py cloud setup). Posts the next waiting reel, even
+# when the laptop is off. GitHub's timer often runs late or not at all at busy times (the start
+# of every hour above all), so the job looks every 15 minutes, away from the busy minutes, and
+# also as soon as the laptop uploads a reel or nudges it. It posts only when a reel is waiting
+# and the last post is at least 55 minutes old, so it keeps to the posting rhythm.
+name: Post the next reel
+on:
+  schedule:
+    - cron: "7,22,37,52 * * * *"
+  push:
+    branches: [main]
+    paths: ["reels/*.json", ".kick"]
+  workflow_dispatch: {}
+permissions:
+  contents: write
+concurrency:
+  group: post
+  cancel-in-progress: false
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Is a post due?
+        id: due
+        env:
+          IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
+          IG_USER_ID: ${{ secrets.IG_USER_ID }}
+          IG_API_VERSION: "v25.0"
+          GAP_MINUTES: "55"
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'EOF'
+          import json, os, urllib.error, urllib.request
+          from datetime import datetime, timezone
+
+          def get(url, token):
+              request = urllib.request.Request(url, headers={"Authorization": "Bearer " + token})
+              with urllib.request.urlopen(request, timeout=60) as answer:
+                  return json.load(answer)
+
+          def folder(name):
+              try:
+                  return get(f"https://api.github.com/repos/{os.environ['REPO']}/contents/{name}", os.environ["GH_TOKEN"])
+              except urllib.error.HTTPError as err:
+                  return [] if err.code == 404 else None
+
+          listing = folder("reels")
+          waiting = listing is None or any(item["name"].endswith(".json") for item in listing)
+          pieces = folder("parts")
+          join = pieces is None or bool(pieces)       # videos uploaded in pieces, to put together
+          due = waiting
+          if waiting:
+              try:
+                  url = (f"https://graph.instagram.com/{os.environ['IG_API_VERSION']}/{os.environ['IG_USER_ID']}"
+                         "/media?fields=timestamp&limit=1")
+                  latest = get(url, os.environ["IG_ACCESS_TOKEN"]).get("data") or []
+                  if latest:
+                      last = datetime.strptime(latest[0]["timestamp"], "%Y-%m-%dT%H:%M:%S%z")
+                      minutes = (datetime.now(timezone.utc) - last).total_seconds() / 60
+                      due = minutes >= float(os.environ["GAP_MINUTES"])
+                      print(f"The last post went out {minutes:.0f} minutes ago")
+              except Exception as err:      # the posting step checks Instagram again anyway
+                  print("Could not read when the last post went out:", type(err).__name__)
+          print("A reel is waiting:", waiting, "| posting now:", due, "| pieces to put together:", join)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"due={'true' if due else 'false'}\n")
+              out.write(f"join={'true' if join else 'false'}\n")
+              out.write(f"work={'true' if due or join else 'false'}\n")
+          EOF
+      - uses: actions/checkout@v4
+        if: steps.due.outputs.work == 'true'
+      - name: Put uploaded videos together
+        if: steps.due.outputs.join == 'true'
+        run: |
+          shopt -s nullglob
+          git config user.name "reelbot"
+          git config user.email "reelbot@users.noreply.github.com"
+          joined=no
+          for dir in parts/*/; do
+            id=$(basename "$dir")
+            cat "$dir"* > "reels/$id.mp4"
+            git rm -rq "$dir"
+            git add "reels/$id.mp4"
+            echo "Put together $id ($(du -h "reels/$id.mp4" | cut -f1))"
+            joined=yes
+          done
+          if [ "$joined" = yes ]; then
+            git commit -qm "Videos put together"
+            saved=no
+            for attempt in 1 2 3; do
+              if git pull --rebase && git push; then saved=yes; break; fi
+              sleep 10
+            done
+            [ "$saved" = yes ] || exit 1
+          fi
+      - uses: actions/setup-python@v5
+        if: steps.due.outputs.due == 'true'
+        with:
+          python-version: "3.12"
+      - run: pip install requests==2.32.3
+        if: steps.due.outputs.due == 'true'
+      - name: Post
+        if: steps.due.outputs.due == 'true'
+        env:
+          IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
+          IG_USER_ID: ${{ secrets.IG_USER_ID }}
+          IG_API_VERSION: "v25.0"
+          PAGES_URL: "https://rishikesh8pandey.github.io/reelbot-posting/"
+        run: python cloud_post.py
+      - name: Save the result and keep the repository small
+        if: always() && steps.due.outputs.due == 'true'
+        run: |
+          git config user.name "reelbot"
+          git config user.email "reelbot@users.noreply.github.com"
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m "Posting result"
+            saved=no
+            for attempt in 1 2 3; do
+              if git pull --rebase && git push; then saved=yes; break; fi
+              sleep 10
+            done
+            [ "$saved" = yes ] || exit 1
+          fi
+          # Deleted videos stay in the history and would soon fill the repository (GitHub asks
+          # for under 1-5 GB), so the history is squashed to one commit holding only what is
+          # waiting. --force-with-lease never overwrites a reel the laptop uploaded meanwhile:
+          # the push is then refused, and the next run tries again.
+          expected=$(git rev-parse HEAD)
+          git checkout -q --orphan squashed
+          git commit -q -m "Reels waiting to be posted"
+          git push --force-with-lease=main:$expected origin squashed:main || echo "History not squashed this time"
